@@ -12,9 +12,17 @@
 #   ./build_v4xx.sh --type lineage --setup --source-dir /mnt/android/lineage-14.1
 #   ./build_v4xx.sh --type lineage --sync
 #   ./build_v4xx.sh --type lineage --sync --sync-jobs 2
+#   ./build_v4xx.sh --type lineage --sync --project kernel/lge/v4xx
+#   ./build_v4xx.sh --type lineage --project kernel/lge/v4xx \
+#     --project device/lge/v4xx-common
 #   ./build_v4xx.sh --type lineage --device v410 --out-tmpfs 48G \
 #     --jack-heap 12G --jack-jobs 8
 #   ./build_v4xx.sh --type twrp --device all
+#   ./build_v4xx.sh --type lineage --device v410 --bootimage
+#   ./build_v4xx.sh --type lineage --device v410 --bootimage --magisk \
+#     --magisk-apk /path/to/Magisk.apk
+#   ./build_v4xx.sh --type lineage --device v410 --magisk \
+#     --magisk-apk /path/to/Magisk.apk
 #
 # Options:
 #   --type TYPE          twrp or lineage
@@ -22,6 +30,9 @@
 #                        also initialize the selected source tree
 #   --source-dir PATH    Source tree for the selected type (saved in config)
 #   --sync               Sync the selected source tree
+#   --project PATH       Sync only this repo path (repeatable; implies --sync).
+#                        Same jobs/retries/flags as full sync. Example:
+#                        kernel/lge/v4xx or device/lge/v410
 #   --device DEV|all     Build v400/v410/v480/v490 or all
 #   --jobs N             Parallel build jobs (default: nproc)
 #   --sync-jobs N        Parallel repo sync jobs (default: 4; keep low to
@@ -33,6 +44,13 @@
 #   --jack-home PATH     Jack server dir (default: <source-parent>/.jack-server
 #                        on the source disk; avoids tiny LXC rootfs)
 #   --no-clobber         Skip make clobber
+#   --bootimage          Build boot.img only (lineage; implies --no-clobber)
+#   --magisk             Patch release boot.img with Magisk on the host.
+#                        With --bootimage: build then patch. Without: patch
+#                        existing lineage-14.1-boot-<device>.img only.
+#                        Requires --magisk-apk or saved config.
+#   --magisk-apk PATH    Magisk Manager APK for host boot patching (armeabi-v7a
+#                        libs required for v4xx)
 #   --release-dir PATH   Shared output directory (default: ~/twrp-releases)
 #   -h, --help           Show help
 
@@ -52,16 +70,20 @@ RELEASE_DIR="${HOME}/twrp-releases"
 JOBS="$(nproc --all 2>/dev/null || echo 4)"
 # googlesource anonymous quota is easily exhausted at high -j; Lineage wiki
 # defaults to -j4. Build jobs stay at nproc separately.
-SYNC_JOBS=4
+SYNC_JOBS=24
 SYNC_RETRIES=8
-OUT_TMPFS_SIZE=""
-JACK_HEAP="4G"
-JACK_JOBS=4
+OUT_TMPFS_SIZE="48G"
+JACK_HEAP="24G"
+JACK_JOBS=16
 JACK_HOME_OVERRIDE=""
 DO_SETUP=0
 DO_SYNC=0
 DEVICE=""
 NO_CLOBBER=0
+BUILD_BOOTIMAGE=0
+PATCH_MAGISK=0
+MAGISK_APK=""
+SYNC_PROJECTS=()
 
 MANIFEST_URL=""
 MANIFEST_BRANCH=""
@@ -69,11 +91,12 @@ LOCAL_MANIFESTS_BRANCH=""
 LUNCH_VARIANT=""
 
 usage() {
-  sed -n '2,38p' "$0"
+  sed -n '2,55p' "$0"
 }
 
 die() { echo "ERROR: $*" >&2; exit 1; }
-info() { echo "==> $*"; }
+# Log to stderr so command substitutions (e.g. ensure_magisk_tools) stay clean.
+info() { echo "==> $*" >&2; }
 warn() { echo "WARNING: $*" >&2; }
 
 load_conf() {
@@ -107,6 +130,7 @@ save_conf() {
     printf 'TWRP_SOURCE_DIR=%q\n' "$TWRP_SOURCE_DIR"
     printf 'LINEAGE_SOURCE_DIR=%q\n' "$LINEAGE_SOURCE_DIR"
     printf 'RELEASE_DIR=%q\n' "$RELEASE_DIR"
+    printf 'MAGISK_APK=%q\n' "$MAGISK_APK"
   } >"$CONF_FILE"
   info "Saved config to ${CONF_FILE}"
 }
@@ -120,6 +144,12 @@ parse_args() {
         ;;
       --setup) DO_SETUP=1 ;;
       --sync) DO_SYNC=1 ;;
+      --project)
+        shift
+        [[ -n "${1:-}" ]] || die "--project requires a repo path (e.g. kernel/lge/v4xx)"
+        SYNC_PROJECTS+=("$1")
+        DO_SYNC=1
+        ;;
       --source-dir)
         shift
         REQUESTED_SOURCE_DIR="${1:?--source-dir requires a path}"
@@ -157,6 +187,12 @@ parse_args() {
         JACK_HOME_OVERRIDE="${1:?--jack-home requires a path}"
         ;;
       --no-clobber) NO_CLOBBER=1 ;;
+      --bootimage) BUILD_BOOTIMAGE=1 ;;
+      --magisk) PATCH_MAGISK=1 ;;
+      --magisk-apk)
+        shift
+        MAGISK_APK="${1:?--magisk-apk requires a path}"
+        ;;
       --release-dir)
         shift
         RELEASE_DIR="${1:?--release-dir requires a path}"
@@ -407,7 +443,8 @@ sync_sources() {
 
   # Re-apply init options for existing Lineage trees too. Without --git-lfs,
   # repo sync can leave large prebuilts (such as webview.apk) as LFS pointers.
-  if [[ "$BUILD_TYPE" == "lineage" ]]; then
+  # Skip re-init for single-project syncs (tree already initialized).
+  if [[ "$BUILD_TYPE" == "lineage" && ${#SYNC_PROJECTS[@]} -eq 0 ]]; then
     if ! command -v git-lfs >/dev/null 2>&1; then
       info "Installing git-lfs (required for chromium-webview prebuilts)..."
       sudo apt-get update -qq
@@ -430,24 +467,31 @@ sync_sources() {
   local max_attempts=$((SYNC_RETRIES + 1))
   local delay=30
   local rc=0
+  local sync_label="${BUILD_TYPE}"
+  if [[ ${#SYNC_PROJECTS[@]} -gt 0 ]]; then
+    sync_label="${BUILD_TYPE} [${SYNC_PROJECTS[*]}]"
+  fi
 
   while [[ "$attempt" -le "$max_attempts" ]]; do
-    info "Syncing ${BUILD_TYPE} (attempt ${attempt}/${max_attempts}, jobs=${SYNC_JOBS})..."
+    info "Syncing ${sync_label} (attempt ${attempt}/${max_attempts}, jobs=${SYNC_JOBS})..."
     set +e
     if [[ "$BUILD_TYPE" == "twrp" ]]; then
       repo sync --jobs="$SYNC_JOBS" --fetch-submodules --current-branch \
-        --no-clone-bundle --force-sync
+        --no-clone-bundle --force-sync "${SYNC_PROJECTS[@]}"
       rc=$?
     else
       repo sync --jobs="$SYNC_JOBS" --current-branch --no-clone-bundle \
-        --force-sync
+        --force-sync "${SYNC_PROJECTS[@]}"
       rc=$?
     fi
     set -e
 
     if [[ "$rc" -eq 0 ]]; then
-      ensure_vendorsetup
-      info "${BUILD_TYPE} sync complete."
+      # vendorsetup only matters for device trees; cheap to keep for full sync.
+      if [[ ${#SYNC_PROJECTS[@]} -eq 0 ]]; then
+        ensure_vendorsetup
+      fi
+      info "${sync_label} sync complete."
       return 0
     fi
 
@@ -784,13 +828,270 @@ copy_lineage_artifacts() {
   fi
 }
 
+copy_lineage_bootimage() {
+  local product="$1"
+  local src="${SOURCE_DIR}/out/target/product/${product}/boot.img"
+  [[ -f "$src" ]] || die "Build finished but ${src} is missing"
+  local dest="${RELEASE_DIR}/lineage-14.1-boot-${product}.img"
+  mkdir -p "$RELEASE_DIR"
+  cp -f "$src" "$dest"
+  info "Copied -> ${dest}"
+  ls -lh "$dest"
+}
+
+magisk_cache_key() {
+  local apk="$1"
+  local base hash host
+  base="$(basename "$apk" .apk)"
+  host="$(uname -m)"
+  if command -v sha256sum >/dev/null 2>&1; then
+    hash="$(sha256sum "$apk" | awk '{print $1}' | cut -c1-12)"
+  else
+    hash="$(stat -c '%Y-%n' "$apk" | sha256sum 2>/dev/null | awk '{print $1}' | cut -c1-12 ||
+      stat -c '%Y' "$apk")"
+  fi
+  # v2: host magiskboot must not be overwritten by armeabi-v7a libmagiskboot.so
+  echo "${base}-${hash}-${host}-v2"
+}
+
+magisk_host_lib_dir() {
+  local extract_dir="$1"
+  case "$(uname -m)" in
+    x86_64|amd64)
+      if [[ -d "${extract_dir}/lib/x86_64" ]]; then
+        echo "${extract_dir}/lib/x86_64"
+      elif [[ -d "${extract_dir}/lib/x86" ]]; then
+        echo "${extract_dir}/lib/x86"
+      fi
+      ;;
+    i386|i686)
+      [[ -d "${extract_dir}/lib/x86" ]] && echo "${extract_dir}/lib/x86"
+      ;;
+    aarch64|arm64)
+      [[ -d "${extract_dir}/lib/arm64-v8a" ]] && echo "${extract_dir}/lib/arm64-v8a"
+      ;;
+    armv7*|arm)
+      [[ -d "${extract_dir}/lib/armeabi-v7a" ]] && echo "${extract_dir}/lib/armeabi-v7a"
+      ;;
+  esac
+}
+
+magisk_hostify_util_functions() {
+  local uf="$1"
+  [[ -f "$uf" ]] || return 0
+
+  # boot_patch.sh sources util_functions.sh; stub recovery-only helpers on Linux.
+  if grep -q '^ui_print()' "$uf"; then
+    # Avoid multiline sed replace (easy to corrupt when pasting the script).
+    awk '
+      BEGIN { skip=0 }
+      /^ui_print\(\)/ { print "ui_print() { echo \"[Magisk] $*\"; }"; skip=1; next }
+      skip && /^}/ { skip=0; next }
+      !skip { print }
+    ' "$uf" >"${uf}.tmp" && mv "${uf}.tmp" "$uf"
+  else
+    printf '%s\n' 'ui_print() { echo "[Magisk] $*"; }' >>"$uf"
+  fi
+
+  if ! grep -q '^getprop()' "$uf"; then
+    cat >>"$uf" <<'EOF'
+
+getprop() {
+  if command -v adb >/dev/null 2>&1 &&
+    adb get-state 2>/dev/null | grep -qx device; then
+    adb shell getprop "$1" 2>/dev/null || true
+  fi
+}
+EOF
+  fi
+}
+
+ensure_magisk_tools() {
+  local apk="$1"
+  local cache_dir stamp extract_dir host_dir arm_dir lib name
+
+  [[ -f "$apk" ]] || die "Magisk APK not found: ${apk}"
+  command -v unzip >/dev/null 2>&1 ||
+    die "unzip is required for Magisk patching (apt install unzip)"
+
+  cache_dir="${SCRIPT_DIR}/.magisk-tools/$(magisk_cache_key "$apk")"
+  stamp="${cache_dir}/.stamp"
+
+  if [[ -f "$stamp" && ! "$apk" -nt "$stamp" &&
+        -x "${cache_dir}/magiskboot" && -f "${cache_dir}/boot_patch.sh" ]]; then
+    info "Using cached Magisk tools: ${cache_dir}"
+    printf '%s' "$cache_dir"
+    return 0
+  fi
+
+  info "Extracting Magisk tools from ${apk}..."
+  mkdir -p "$cache_dir"
+  extract_dir="$(mktemp -d /tmp/v4xx-magisk-extract-XXXX)"
+  unzip -qo "$apk" -d "$extract_dir"
+
+  [[ -f "${extract_dir}/assets/boot_patch.sh" ]] ||
+    die "Magisk APK missing assets/boot_patch.sh"
+  cp -f "${extract_dir}/assets/boot_patch.sh" "${cache_dir}/boot_patch.sh"
+  # Drop CR and neutralize dos2unix calls (often missing on build hosts).
+  sed -i 's/\r$//' "${cache_dir}/boot_patch.sh"
+  sed -i 's/\bdos2unix\b/true/g' "${cache_dir}/boot_patch.sh"
+  if [[ -f "${extract_dir}/assets/util_functions.sh" ]]; then
+    cp -f "${extract_dir}/assets/util_functions.sh" "${cache_dir}/util_functions.sh"
+    sed -i 's/\r$//' "${cache_dir}/util_functions.sh"
+    sed -i 's/\bdos2unix\b/true/g' "${cache_dir}/util_functions.sh"
+    magisk_hostify_util_functions "${cache_dir}/util_functions.sh"
+  fi
+  if [[ -f "${extract_dir}/assets/stub.apk" ]]; then
+    cp -f "${extract_dir}/assets/stub.apk" "${cache_dir}/stub.apk"
+  fi
+
+  host_dir="$(magisk_host_lib_dir "$extract_dir")"
+  if [[ -z "$host_dir" || ! -f "${host_dir}/libmagiskboot.so" ]]; then
+    rm -rf "$extract_dir"
+    die "Magisk APK missing host libmagiskboot.so for $(uname -m)"
+  fi
+  # Host-arch magiskboot unpacks/repacks on the build machine.
+  cp -f "${host_dir}/libmagiskboot.so" "${cache_dir}/magiskboot"
+  chmod +x "${cache_dir}/magiskboot"
+
+  arm_dir="${extract_dir}/lib/armeabi-v7a"
+  if [[ ! -d "$arm_dir" ]]; then
+    rm -rf "$extract_dir"
+    die "Magisk APK has no armeabi-v7a libs; v4xx (msm8226) requires a Magisk build with 32-bit ARM support"
+  fi
+
+  if [[ -f "${arm_dir}/libmagiskinit.so" ]]; then
+    cp -f "${arm_dir}/libmagiskinit.so" "${cache_dir}/magiskinit"
+  else
+    rm -rf "$extract_dir"
+    die "Magisk APK missing lib/armeabi-v7a/libmagiskinit.so"
+  fi
+  chmod +x "${cache_dir}/magiskinit"
+
+  if [[ -f "${arm_dir}/libmagisk.so" ]]; then
+    cp -f "${arm_dir}/libmagisk.so" "${cache_dir}/magisk"
+    cp -f "${arm_dir}/libmagisk.so" "${cache_dir}/magisk32"
+  elif [[ -f "${arm_dir}/libmagisk32.so" ]]; then
+    cp -f "${arm_dir}/libmagisk32.so" "${cache_dir}/magisk32"
+    cp -f "${arm_dir}/libmagisk32.so" "${cache_dir}/magisk"
+  else
+    rm -rf "$extract_dir"
+    die "Magisk APK missing lib/armeabi-v7a/libmagisk.so or libmagisk32.so"
+  fi
+  chmod +x "${cache_dir}/magisk" "${cache_dir}/magisk32"
+
+  if [[ -f "${arm_dir}/libinit-ld.so" ]]; then
+    cp -f "${arm_dir}/libinit-ld.so" "${cache_dir}/init-ld"
+    chmod +x "${cache_dir}/init-ld"
+  fi
+
+  # Device-arch helpers only — never overwrite host magiskboot with ARM.
+  if [[ -f "${arm_dir}/libmagiskpolicy.so" ]]; then
+    cp -f "${arm_dir}/libmagiskpolicy.so" "${cache_dir}/magiskpolicy"
+    chmod +x "${cache_dir}/magiskpolicy"
+  fi
+
+  cp -f "$apk" "${cache_dir}/source.apk" 2>/dev/null || true
+  touch "$stamp"
+  rm -rf "$extract_dir"
+  info "Magisk tools prepared in ${cache_dir}"
+  printf '%s' "$cache_dir"
+}
+
+patch_bootimage_with_magisk() {
+  local product="$1"
+  local src dest tools_dir workdir
+  src="${RELEASE_DIR}/lineage-14.1-boot-${product}.img"
+  [[ -f "$src" ]] || die "Unpatched boot image missing: ${src}"
+
+  tools_dir="$(ensure_magisk_tools "$MAGISK_APK")"
+  workdir="$(mktemp -d /tmp/v4xx-magisk-XXXX)"
+  cp -a "${tools_dir}/." "$workdir/"
+  cp -f "$src" "${workdir}/boot.img"
+  # Prefer workdir binaries; provide a dos2unix stub if the host lacks it.
+  if ! command -v dos2unix >/dev/null 2>&1; then
+    cat >"${workdir}/dos2unix" <<'EOF'
+#!/bin/sh
+# Minimal dos2unix stand-in for Magisk scripts on bare build hosts.
+for f in "$@"; do
+  [ -f "$f" ] || continue
+  sed -i 's/\r$//' "$f"
+done
+EOF
+    chmod +x "${workdir}/dos2unix"
+  fi
+
+  info "Patching boot.img with Magisk for ${product}..."
+  (
+    cd "$workdir"
+    export PATH="${workdir}:${PATH}"
+    export KEEPVERITY=true
+    export KEEPFORCEENCRYPT=true
+    sh ./boot_patch.sh ./boot.img
+  )
+
+  [[ -f "${workdir}/new-boot.img" ]] ||
+    die "Magisk boot_patch.sh did not produce new-boot.img"
+
+  dest="${RELEASE_DIR}/lineage-14.1-boot-${product}-magisk.img"
+  cp -f "${workdir}/new-boot.img" "$dest"
+  rm -rf "$workdir"
+  info "Copied Magisk-patched boot -> ${dest}"
+  ls -lh "$dest"
+}
+
+validate_magisk_opts() {
+  [[ "$PATCH_MAGISK" -eq 1 ]] || return 0
+  [[ "$BUILD_TYPE" == "lineage" ]] || die "--magisk requires --type lineage"
+  command -v unzip >/dev/null 2>&1 ||
+    die "unzip is required for Magisk patching (apt install unzip)"
+  [[ -n "$MAGISK_APK" ]] ||
+    die "--magisk requires --magisk-apk PATH (or set MAGISK_APK in ${CONF_FILE})"
+  [[ -f "$MAGISK_APK" ]] || die "Magisk APK not found: ${MAGISK_APK}"
+  MAGISK_APK="$(cd "$(dirname "$MAGISK_APK")" && pwd)/$(basename "$MAGISK_APK")"
+}
+
+patch_selected_devices_magisk() {
+  if [[ "$DEVICE" == "all" ]]; then
+    local d
+    for d in "${DEVICES[@]}"; do
+      patch_bootimage_with_magisk "$d"
+    done
+    return
+  fi
+
+  local d valid=0
+  for d in "${DEVICES[@]}"; do
+    if [[ "$DEVICE" == "$d" ]]; then
+      valid=1
+      break
+    fi
+  done
+  [[ "$valid" -eq 1 ]] ||
+    die "Unknown device '${DEVICE}' (expected: ${DEVICES[*]}|all)"
+  patch_bootimage_with_magisk "$DEVICE"
+}
+
 build_device() {
   local product="$1"
   local target="lineage_${product}-${LUNCH_VARIANT}"
+
+  if [[ "$BUILD_BOOTIMAGE" -eq 1 && "$BUILD_TYPE" != "lineage" ]]; then
+    die "--bootimage is only supported for --type lineage"
+  fi
+  if [[ "$BUILD_BOOTIMAGE" -eq 1 && "$NO_CLOBBER" -eq 0 ]]; then
+    warn "--bootimage implies --no-clobber (skipping make clobber)"
+    NO_CLOBBER=1
+  fi
+
   ensure_source_dir
   ensure_vendorsetup
   set_build_env
-  info "Building ${BUILD_TYPE} for ${product} (${target}, jobs=${JOBS})"
+  if [[ "$BUILD_BOOTIMAGE" -eq 1 ]]; then
+    info "Building bootimage for ${product} (${target}, jobs=${JOBS})"
+  else
+    info "Building ${BUILD_TYPE} for ${product} (${target}, jobs=${JOBS})"
+  fi
 
   # envsetup / lunch / mka freely reference unset vars (TOP, etc.).
   # Keep nounset off for the entire Android build phase.
@@ -806,8 +1107,10 @@ build_device() {
     warn "Skipping make clobber (--no-clobber)"
   fi
 
-  prepare_out_tmpfs
-  configure_jack_server
+  if [[ "$BUILD_BOOTIMAGE" -eq 0 ]]; then
+    prepare_out_tmpfs
+    configure_jack_server
+  fi
 
   # Re-source after clobber/tmpfs so all generated files go to the active out/.
   # shellcheck disable=SC1091
@@ -818,6 +1121,13 @@ build_device() {
     make -j"$JOBS" recoveryimage
     set -u
     copy_twrp_artifact "$product"
+  elif [[ "$BUILD_BOOTIMAGE" -eq 1 ]]; then
+    mka bootimage
+    set -u
+    copy_lineage_bootimage "$product"
+    if [[ "$PATCH_MAGISK" -eq 1 ]]; then
+      patch_bootimage_with_magisk "$product"
+    fi
   else
     # mka already picks a job count; pass bacon only
     mka bacon
@@ -858,23 +1168,99 @@ type_menu() {
     echo "  3) Build v480"
     echo "  4) Build v490"
     echo "  5) Build ALL devices"
-    echo "  6) Sync sources"
-    echo "  7) Configure source tree"
+    echo "  6) Sync sources (full tree)"
+    echo "  7) Sync specific project(s)"
+    echo "  8) Configure source tree"
+    if [[ "$BUILD_TYPE" == "lineage" ]]; then
+      echo "  9) Build bootimage only"
+      echo " 10) Patch existing boot.img with Magisk"
+    fi
     echo "  b) Back"
     read -r -p "Select: " choice
     case "$choice" in
       1|2|3|4)
         DEVICE="${DEVICES[$((choice - 1))]}"
         build_selected_devices
+        DEVICE=""
         ;;
-      5) DEVICE=all; build_selected_devices ;;
-      6) sync_sources ;;
+      5) DEVICE=all; build_selected_devices; DEVICE="" ;;
+      6)
+        SYNC_PROJECTS=()
+        sync_sources
+        ;;
       7)
+        SYNC_PROJECTS=()
+        echo "Enter repo path(s) relative to source root (space-separated)."
+        echo "Examples: kernel/lge/v4xx  device/lge/v4xx-common"
+        read -r -p "Project(s): " project_line
+        # shellcheck disable=SC2206
+        SYNC_PROJECTS=(${project_line})
+        [[ ${#SYNC_PROJECTS[@]} -gt 0 ]] || {
+          warn "No projects given"
+          continue
+        }
+        sync_sources
+        SYNC_PROJECTS=()
+        ;;
+      8)
         read -r -p "${BUILD_TYPE} source directory: " REQUESTED_SOURCE_DIR
         select_type "$BUILD_TYPE"
         install_repo_tool
         setup_source_tree
         REQUESTED_SOURCE_DIR=""
+        ;;
+      9)
+        if [[ "$BUILD_TYPE" != "lineage" ]]; then
+          warn "Bootimage builds are lineage-only"
+          continue
+        fi
+        echo "  1) v400  2) v410  3) v480  4) v490"
+        read -r -p "Select device: " dev_choice
+        case "$dev_choice" in
+          1|2|3|4)
+            DEVICE="${DEVICES[$((dev_choice - 1))]}"
+            BUILD_BOOTIMAGE=1
+            PATCH_MAGISK=0
+            read -r -p "Patch boot.img with Magisk? [y/N]: " magisk_choice
+            case "$magisk_choice" in
+              y|Y|yes|Yes|YES)
+                PATCH_MAGISK=1
+                if [[ -z "$MAGISK_APK" ]]; then
+                  read -r -p "Path to Magisk.apk: " MAGISK_APK
+                fi
+                validate_magisk_opts
+                ;;
+            esac
+            build_selected_devices
+            BUILD_BOOTIMAGE=0
+            PATCH_MAGISK=0
+            DEVICE=""
+            ;;
+          *) warn "Invalid selection" ;;
+        esac
+        ;;
+      10)
+        if [[ "$BUILD_TYPE" != "lineage" ]]; then
+          warn "Magisk patching is lineage-only"
+          continue
+        fi
+        echo "  1) v400  2) v410  3) v480  4) v490"
+        read -r -p "Select device: " dev_choice
+        case "$dev_choice" in
+          1|2|3|4)
+            DEVICE="${DEVICES[$((dev_choice - 1))]}"
+            PATCH_MAGISK=1
+            BUILD_BOOTIMAGE=0
+            if [[ -z "$MAGISK_APK" ]]; then
+              read -r -p "Path to Magisk.apk: " MAGISK_APK
+            fi
+            validate_magisk_opts
+            patch_selected_devices_magisk
+            PATCH_MAGISK=0
+            DEVICE=""
+            ;;
+          *) warn "Invalid selection" ;;
+        esac
         ;;
       b|B) return ;;
       *) warn "Invalid selection" ;;
@@ -911,7 +1297,8 @@ main() {
 
   if [[ -n "$BUILD_TYPE" ]]; then
     select_type "$BUILD_TYPE"
-  elif [[ -n "$REQUESTED_SOURCE_DIR" || "$DO_SYNC" -eq 1 || -n "$DEVICE" ]]; then
+  elif [[ -n "$REQUESTED_SOURCE_DIR" || "$DO_SYNC" -eq 1 ||
+          ${#SYNC_PROJECTS[@]} -gt 0 || -n "$DEVICE" ]]; then
     die "--type twrp|lineage is required for source, sync, and build operations"
   fi
 
@@ -929,8 +1316,14 @@ main() {
     sync_sources
   fi
   if [[ -n "$DEVICE" ]]; then
+    validate_magisk_opts
     save_conf
-    build_selected_devices
+    # --magisk without --bootimage patches an existing release boot.img only.
+    if [[ "$PATCH_MAGISK" -eq 1 && "$BUILD_BOOTIMAGE" -eq 0 ]]; then
+      patch_selected_devices_magisk
+    else
+      build_selected_devices
+    fi
   fi
 
   if [[ "$DO_SETUP" -eq 0 && "$DO_SYNC" -eq 0 && -z "$DEVICE" &&
